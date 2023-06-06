@@ -1157,6 +1157,7 @@ class GenerationMixin:
         model_teacher3: Optional["PreTrainedModel"] = None,   #added by Vedant
         consensus: str = "cosine",                           #added by Vedant
         beta: int = 1,                                         #added by Vedant
+        gamma: float = 0.7,                                     #added by Vedant
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         r"""
@@ -1323,15 +1324,30 @@ class GenerationMixin:
                     "generation results, please set `padding_side='left'` when initializing the tokenizer."
                 )
 
+
+
+
         if self.config.is_encoder_decoder and "encoder_outputs" not in model_kwargs:
             # if model is encoder decoder encoder_outputs are created
             # and added to `model_kwargs`
+            model_kwargs2 = copy.deepcopy(model_kwargs)
+            model_kwargs3 = copy.deepcopy(model_kwargs)
             model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(
                 inputs_tensor, model_kwargs, model_input_name
             )
+            if model_teacher2 and model_teacher3:
+                #works currently as same model is used for all three teachers
+                model_kwargs2 = model_teacher2._prepare_encoder_decoder_kwargs_for_generation(
+                    inputs_tensor, model_kwargs2, model_input_name
+                )
+                model_kwargs3 = model_teacher3._prepare_encoder_decoder_kwargs_for_generation(
+                    inputs_tensor, model_kwargs3, model_input_name
+                )
 
         # 5. Prepare `input_ids` which will be used for auto-regressive generation
         if self.config.is_encoder_decoder:
+            
+           
             input_ids, model_kwargs = self._prepare_decoder_input_ids_for_generation(
                 batch_size=batch_size,
                 model_input_name=model_input_name,
@@ -1340,6 +1356,28 @@ class GenerationMixin:
                 bos_token_id=generation_config.bos_token_id,
                 device=inputs_tensor.device,
             )
+
+            if model_teacher2 and model_teacher3:
+                #added by Vedant. This code won't work for different models
+                #input_ids2, model_kwargs2 = self._prepare_decoder_input_ids_for_generation(
+                _, model_kwargs2 = model_teacher2._prepare_decoder_input_ids_for_generation(
+                    batch_size=batch_size,
+                    model_input_name=model_input_name,
+                    model_kwargs=model_kwargs2,
+                    decoder_start_token_id=generation_config.decoder_start_token_id,
+                    bos_token_id=generation_config.bos_token_id,
+                    device=inputs_tensor.device,
+                )
+                #input_ids3, model_kwargs3 = self._prepare_decoder_input_ids_for_generation(
+                _, model_kwargs3 = model_teacher3._prepare_decoder_input_ids_for_generation(
+                    batch_size=batch_size,
+                    model_input_name=model_input_name,
+                    model_kwargs=model_kwargs3,
+                    decoder_start_token_id=generation_config.decoder_start_token_id,
+                    bos_token_id=generation_config.bos_token_id,
+                    device=inputs_tensor.device,
+                )
+
         else:
             input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
 
@@ -1520,18 +1558,39 @@ class GenerationMixin:
                 )
 
             # 11. run greedy search
-            return self.greedy_search(
-                input_ids,
-                logits_processor=logits_processor,
-                stopping_criteria=stopping_criteria,
-                pad_token_id=generation_config.pad_token_id,
-                eos_token_id=generation_config.eos_token_id,
-                output_scores=generation_config.output_scores,
-                return_dict_in_generate=generation_config.return_dict_in_generate,
-                synced_gpus=synced_gpus,
-                streamer=streamer,
-                **model_kwargs,
-            )
+            if model_teacher2 and model_teacher3:
+                return self.greedy_search_multi_teacher(
+                    input_ids,
+                    consensus=consensus,
+                    no_of_teacher=3,
+                    gamma=gamma,
+                    model_teacher2=model_teacher2,
+                    model_teacher3=model_teacher3,
+                    logits_processor=logits_processor,
+                    stopping_criteria=stopping_criteria,
+                    pad_token_id=generation_config.pad_token_id,
+                    eos_token_id=generation_config.eos_token_id,
+                    output_scores=generation_config.output_scores,
+                    return_dict_in_generate=generation_config.return_dict_in_generate,
+                    synced_gpus=synced_gpus,
+                    streamer=streamer,
+                    model_kwargs2=model_kwargs2,
+                    model_kwargs3=model_kwargs3,
+                    **model_kwargs,
+                )
+            else:
+                return self.greedy_search(
+                    input_ids,
+                    logits_processor=logits_processor,
+                    stopping_criteria=stopping_criteria,
+                    pad_token_id=generation_config.pad_token_id,
+                    eos_token_id=generation_config.eos_token_id,
+                    output_scores=generation_config.output_scores,
+                    return_dict_in_generate=generation_config.return_dict_in_generate,
+                    synced_gpus=synced_gpus,
+                    streamer=streamer,
+                    **model_kwargs,
+                )
 
         elif is_contrastive_search_gen_mode:
             if generation_config.num_return_sequences > 1:
@@ -1562,6 +1621,8 @@ class GenerationMixin:
             logits_warper = self._get_logits_warper(generation_config)
 
             # 12. expand input_ids with `num_return_sequences` additional sequences per batch
+            #copy input ids for teacher 2 and teacher 3
+            input_ids2 = input_ids.detach().clone()
             input_ids, model_kwargs = self._expand_inputs_for_generation(
                 input_ids=input_ids,
                 expand_size=generation_config.num_return_sequences,
@@ -1569,12 +1630,33 @@ class GenerationMixin:
                 **model_kwargs,
             )
 
+            #Do step 12 for teacher 2 and teacher 3
+            _, model_kwargs2 = model_teacher2._expand_inputs_for_generation(
+                input_ids=input_ids2,
+                expand_size=generation_config.num_return_sequences,
+                is_encoder_decoder=model_teacher2.config.is_encoder_decoder,
+                **model_kwargs2,
+            )
+
+            _, model_kwargs3 = model_teacher3._expand_inputs_for_generation(
+                input_ids=input_ids2,
+                expand_size=generation_config.num_return_sequences,
+                is_encoder_decoder=model_teacher3.config.is_encoder_decoder,
+                **model_kwargs3,
+            )
+
+
+
+
             # 13. run sample
             if model_teacher3 != None and model_teacher2 != None:
                 # prepare model input
                 return self.sample_multi_teacher(
                     input_ids,
+                    #input_ids2, #Not needed for same models
+                    #input_ids3, #Not needed for same models
                     beta=beta,
+                    gamma=gamma,
                     model_teacher2= model_teacher2,   #added by Vedant
                     model_teacher3= model_teacher3,   #added by Vedant
                     consensus=consensus,
@@ -1587,6 +1669,8 @@ class GenerationMixin:
                     return_dict_in_generate=generation_config.return_dict_in_generate,
                     synced_gpus=synced_gpus,
                     streamer=streamer,
+                    model_kwargs2=model_kwargs2, #added by Vedant
+                    model_kwargs3=model_kwargs3, #added by Vedant
                     **model_kwargs,
                 )
             else:
@@ -1623,12 +1707,31 @@ class GenerationMixin:
                 max_length=generation_config.max_length,
             )
             # 12. interleave input_ids with `num_beams` additional sequences per batch
+            #copy input_ids for teacher 2 and teacher 3
+            input_ids2 = input_ids.clone()
             input_ids, model_kwargs = self._expand_inputs_for_generation(
                 input_ids=input_ids,
                 expand_size=generation_config.num_beams,
                 is_encoder_decoder=self.config.is_encoder_decoder,
                 **model_kwargs,
             )
+
+            #Do step 12 for teacher 2 and teacher 3
+            _, model_kwargs2 = model_teacher2._expand_inputs_for_generation(
+                input_ids=input_ids2,
+                expand_size=generation_config.num_beams,
+                is_encoder_decoder=model_teacher2.config.is_encoder_decoder,
+                **model_kwargs2,
+            )
+
+            _, model_kwargs3 = model_teacher3._expand_inputs_for_generation(
+                input_ids=input_ids2,
+                expand_size=generation_config.num_beams,
+                is_encoder_decoder=model_teacher3.config.is_encoder_decoder,
+                **model_kwargs3,
+            )
+
+
             if model_teacher3 != None and model_teacher2 != None:
                 # prepare model input
                 #to be added
@@ -1645,6 +1748,8 @@ class GenerationMixin:
                     output_scores=generation_config.output_scores,
                     return_dict_in_generate=generation_config.return_dict_in_generate,
                     synced_gpus=synced_gpus,
+                    model_kwargs2=model_kwargs2, #added by Vedant
+                    model_kwargs3=model_kwargs3, #added by Vedant
                     **model_kwargs,
                 )
             else:
@@ -2209,6 +2314,483 @@ class GenerationMixin:
         else:
             return input_ids
 
+
+    def greedy_search_multi_teacher(
+        self,
+        input_ids: torch.LongTensor,
+        consensus: str,
+        no_of_teacher: int,
+        gamma: float,
+        model_teacher2: Optional["PreTrainedModel"] = None,
+        model_teacher3: Optional["PreTrainedModel"] = None,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        max_length: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[Union[int, List[int]]] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_scores: Optional[bool] = None,
+        return_dict_in_generate: Optional[bool] = None,
+        synced_gpus: bool = False,
+        streamer: Optional["BaseStreamer"] = None,
+        model_kwargs2: Optional[Dict[str, Any]] = None,
+        model_kwargs3: Optional[Dict[str, Any]] = None,
+        **model_kwargs,
+    ) -> Union[GreedySearchOutput, torch.LongTensor]:
+        r"""
+        Generates sequences of token ids for models with a language modeling head using **greedy decoding** and can be
+        used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
+
+        <Tip warning={true}>
+
+        In most cases, you do not need to call [`~generation.GenerationMixin.greedy_search`] directly. Use generate()
+        instead. For an overview of generation strategies and code examples, check the [following
+        guide](../generation_strategies).
+
+        </Tip>
+
+
+        Parameters:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                The sequence used as a prompt for the generation.
+            logits_processor (`LogitsProcessorList`, *optional*):
+                An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsProcessor`]
+                used to modify the prediction scores of the language modeling head applied at each generation step.
+            stopping_criteria (`StoppingCriteriaList`, *optional*):
+                An instance of [`StoppingCriteriaList`]. List of instances of class derived from [`StoppingCriteria`]
+                used to tell if the generation loop should stop.
+
+            max_length (`int`, *optional*, defaults to 20):
+                **DEPRECATED**. Use `logits_processor` or `stopping_criteria` directly to cap the number of generated
+                tokens. The maximum length of the sequence to be generated.
+            pad_token_id (`int`, *optional*):
+                The id of the *padding* token.
+            eos_token_id (`Union[int, List[int]]`, *optional*):
+                The id of the *end-of-sequence* token. Optionally, use a list to set multiple *end-of-sequence* tokens.
+            output_attentions (`bool`, *optional*, defaults to `False`):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more details.
+            output_hidden_states (`bool`, *optional*, defaults to `False`):
+                Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
+                for more details.
+            output_scores (`bool`, *optional*, defaults to `False`):
+                Whether or not to return the prediction scores. See `scores` under returned tensors for more details.
+            return_dict_in_generate (`bool`, *optional*, defaults to `False`):
+                Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+            synced_gpus (`bool`, *optional*, defaults to `False`):
+                Whether to continue running the while loop until max_length (needed for ZeRO stage 3)
+            streamer (`BaseStreamer`, *optional*):
+                Streamer object that will be used to stream the generated sequences. Generated tokens are passed
+                through `streamer.put(token_ids)` and the streamer is responsible for any further processing.
+            model_kwargs:
+                Additional model specific keyword arguments will be forwarded to the `forward` function of the model.
+                If model is an encoder-decoder model the kwargs should include `encoder_outputs`.
+
+        Return:
+            [`~generation.GreedySearchDecoderOnlyOutput`], [`~generation.GreedySearchEncoderDecoderOutput`] or
+            `torch.LongTensor`: A `torch.LongTensor` containing the generated tokens (default behaviour) or a
+            [`~generation.GreedySearchDecoderOnlyOutput`] if `model.config.is_encoder_decoder=False` and
+            `return_dict_in_generate=True` or a [`~generation.GreedySearchEncoderDecoderOutput`] if
+            `model.config.is_encoder_decoder=True`.
+
+        Examples:
+
+        ```python
+        >>> from transformers import (
+        ...     AutoTokenizer,
+        ...     AutoModelForCausalLM,
+        ...     LogitsProcessorList,
+        ...     MinLengthLogitsProcessor,
+        ...     StoppingCriteriaList,
+        ...     MaxLengthCriteria,
+        ... )
+
+        >>> tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        >>> model = AutoModelForCausalLM.from_pretrained("gpt2")
+
+        >>> # set pad_token_id to eos_token_id because GPT2 does not have a PAD token
+        >>> model.generation_config.pad_token_id = model.generation_config.eos_token_id
+
+        >>> input_prompt = "It might be possible to"
+        >>> input_ids = tokenizer(input_prompt, return_tensors="pt").input_ids
+
+        >>> # instantiate logits processors
+        >>> logits_processor = LogitsProcessorList(
+        ...     [
+        ...         MinLengthLogitsProcessor(10, eos_token_id=model.generation_config.eos_token_id),
+        ...     ]
+        ... )
+        >>> stopping_criteria = StoppingCriteriaList([MaxLengthCriteria(max_length=20)])
+
+        >>> outputs = model.greedy_search(
+        ...     input_ids, logits_processor=logits_processor, stopping_criteria=stopping_criteria
+        ... )
+
+        >>> tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        ["It might be possible to get a better understanding of the nature of the problem, but it's not"]
+        ```"""
+        # init values
+        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+        if max_length is not None:
+            warnings.warn(
+                "`max_length` is deprecated in this function, use"
+                " `stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=max_length)])` instead.",
+                UserWarning,
+            )
+            stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
+        pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
+        eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+        if isinstance(eos_token_id, int):
+            eos_token_id = [eos_token_id]
+        eos_token_id_tensor = torch.tensor(eos_token_id).to(input_ids.device) if eos_token_id is not None else None
+        output_scores = output_scores if output_scores is not None else self.generation_config.output_scores
+        output_attentions = (
+            output_attentions if output_attentions is not None else self.generation_config.output_attentions
+        )
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.generation_config.output_hidden_states
+        )
+        return_dict_in_generate = (
+            return_dict_in_generate
+            if return_dict_in_generate is not None
+            else self.generation_config.return_dict_in_generate
+        )
+
+        # init attention / hidden states / scores tuples
+        scores = () if (return_dict_in_generate and output_scores) else None
+        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
+        cross_attentions = () if (return_dict_in_generate and output_attentions) else None
+        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
+
+        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
+        if return_dict_in_generate and self.config.is_encoder_decoder:
+            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+            encoder_hidden_states = (
+                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+            )
+
+        # keep track of which sequences are already finished
+        unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
+
+        this_peer_finished = False  # used by synced_gpus only
+
+
+        import json
+        # auto-regressive generation
+        cur_len = 0
+        hit = False
+        if consensus=="vote":
+            file_name = "hitsGreedy.json"
+            file_name2 = "lenGreedy.json"
+            try:
+                with open (file_name, "r") as myfile:
+                    consensus_hits = json.loads(myfile.read())
+
+            except:
+                consensus_hits = {}
+
+            try:
+                with open(file_name2, "r") as myfile:
+                    words_len = json.loads(myfile.read())
+            except:
+                words_len = {}
+        while True:
+            if synced_gpus:
+                # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
+                # The following logic allows an early break if all peers finished generating their sequence
+                this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(input_ids.device)
+                # send 0.0 if we finished, 1.0 otherwise
+                dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
+                # did all peers finish? the reduced sum will be 0.0 then
+                if this_peer_finished_flag.item() == 0.0:
+                    break
+
+            # prepare model inputs
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            model_inputs2 = model_teacher2.prepare_inputs_for_generation(input_ids, **model_kwargs2)
+            model_inputs3 = model_teacher3.prepare_inputs_for_generation(input_ids, **model_kwargs3)
+
+            # forward pass to get next token
+            outputs = self(
+                **model_inputs,
+                return_dict=True,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+
+            #forward pass to get next token for teacher2
+            outputs2 = model_teacher2(
+                **model_inputs2,
+                return_dict=True,
+                output_attentions=model_teacher2.config.output_attentions,
+                output_hidden_states=model_teacher2.config.output_hidden_states,
+            )
+
+            #forward pass to get next token for teacher 3
+            outputs3 = model_teacher3(
+                **model_inputs3,
+                return_dict=True,
+                output_attentions=model_teacher3.config.output_attentions,
+                output_hidden_states=model_teacher3.config.output_hidden_states,
+            )
+
+            if synced_gpus and this_peer_finished:
+                continue  # don't waste resources running the code we don't need
+
+            next_token_logits = outputs.logits[:, -1, :]
+            next_token_logits2 = outputs2.logits[:, -1, :]
+            next_token_logits3 = outputs3.logits[:, -1, :]
+
+
+            # pre-process distribution
+            next_tokens_scores = logits_processor(input_ids, next_token_logits)
+
+            # pre-process distribution for teacher2
+            next_tokens_scores2 = logits_processor(input_ids, next_token_logits2)
+
+            # pre-process distribution for teacher3
+            next_tokens_scores3 = logits_processor(input_ids, next_token_logits3)
+
+            # Store scores, attentions and hidden_states when required
+            #don't care to store it for teacher2 and 3 for now
+            if return_dict_in_generate:
+                if output_scores:
+                    scores += (next_tokens_scores,)
+                if output_attentions:
+                    decoder_attentions += (
+                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+                    )
+                    if self.config.is_encoder_decoder:
+                        cross_attentions += (outputs.cross_attentions,)
+
+                if output_hidden_states:
+                    decoder_hidden_states += (
+                        (outputs.decoder_hidden_states,)
+                        if self.config.is_encoder_decoder
+                        else (outputs.hidden_states,)
+                    )
+
+            # argmax
+            next_tokens = torch.argmax(next_tokens_scores, dim=-1)
+            next_tokens2 = torch.argmax(next_tokens_scores2, dim=-1)
+            next_tokens3 = torch.argmax(next_tokens_scores3, dim=-1)
+
+            #perform consensus
+
+            if consensus == "average" or consensus == "average vote":
+                pass
+                # weighted_probs = (probs + probs_teacher2 + probs_teacher3)/3
+                # next_tokens_arr = []
+                # #average vote isn't implemented yet, and even with multiple beta functionality remains same
+                # for i in range(beta):
+                #     next_tokens = torch.multinomial(weighted_probs, num_samples=1).squeeze(1)
+                #     next_tokens_arr.append(next_tokens)
+             
+                # #this lets us use voting afterwards
+                # if consensus == "average vote":
+                #     new_next_tokens = torch.zeros_like(next_tokens)
+
+
+                #     #print("new next tokens", new_next_tokens.shape)
+                #     next_tokens_teacher_stacked = torch.stack(next_tokens_arr)
+                #     #to be done
+
+
+            # from scipy import stats
+
+            if consensus == "cosine": 
+                #will be tried later
+
+                new_next_tokens = torch.zeros_like(next_tokens)
+
+                pass
+            #create temp next token with same dimensions as next token
+            elif consensus == "vote" or consensus == "greedy vote": #implementing naive voting with Yuqiao's idea
+                new_next_tokens = torch.zeros_like(next_tokens)
+
+
+                #print("new next tokens", new_next_tokens.shape)
+                next_tokens_teacher_stacked = torch.stack([next_tokens, next_tokens2, next_tokens3])
+
+                #print(next_tokens_teacher_stacked.size(dim=1))
+                no_of_samples = next_tokens_teacher_stacked.size(dim=0)
+                for i in range(next_tokens_teacher_stacked.size(dim=1)):
+                    #iterate over columns
+                    #find unique values and counts
+                    #find max count
+                    next_tokens_teacher_stacked_i = next_tokens_teacher_stacked[:,i]
+                    unique, counts = torch.unique(next_tokens_teacher_stacked_i, return_counts=True)
+                   # print(unique, counts)
+                    pos = torch.argmax(counts)
+
+                    #for now
+                    no_of_teacher = 3
+                    words_len[str(cur_len)] = words_len.get(str(cur_len), 0) + 1
+                    if consensus == "vote" and counts[pos] > no_of_teacher//2:
+                        new_next_tokens[i] = unique[pos]
+                
+                        y = consensus_hits.get(str(cur_len), 0)
+            
+                        consensus_hits[str(cur_len)] = y + 1
+                    else:
+                        new_next_tokens[i] = torch.max(next_tokens_teacher_stacked_i)
+                    #     teacher_batch = beta
+                    #     prob_arr = [probs, probs_teacher2, probs_teacher3]
+                    #     prob_max = -1
+                    #     prob = prob_arr[0]
+                    #     for k in range(no_of_samples):
+                    #         #print("k", k)
+                    #         if k % teacher_batch == 0:
+                    #             prob = prob_arr[k//teacher_batch]
+                    #    #         print("kakakakak", k)
+                    #         if prob[i, next_tokens_teacher_stacked_i[k]] > prob_max:
+                    #             prob_max = prob[i, next_tokens_teacher_stacked_i[k]]
+                    #             new_next_tokens[i] = next_tokens_teacher_stacked_i[k]
+
+                next_tokens = new_next_tokens.detach().clone()
+            elif consensus == "random":
+                #create a new tensor by randomly selecting values from the 3 tensors
+                pass
+            #     new_next_tokens = torch.zeros_like(next_tokens)
+            #     complete_random = True
+            #   #  print(len(next_tokens))
+            #     for i in range(len(next_tokens)):
+            #         j = torch.randint(0,3,(1,))
+            #         #print(i)
+            #         if j == 1:
+            #             new_next_tokens[i] = next_tokens_teacher2[i]
+            #         elif j == 2:
+            #             new_next_tokens[i] = next_tokens_teacher3[i]
+            #         else:
+            #             new_next_tokens[i] = next_tokens[i]
+            #     next_tokens = new_next_tokens.detach().clone()
+                #print(next_tokens)
+            elif consensus == "score":
+                pass
+                # new_next_tokens = torch.zeros_like(next_tokens)
+
+                # # gamma = 0.75 #can be a parameter later
+                # agreement_count = dict() #keys are tokens, values are counts of agreement
+                # def score(prob, agreement):
+                #     return gamma*prob + (1-gamma)*agreement
+                # #scoring formula for a token = gamma* max_probability + (1-gamma)* agreement
+                # #agreement = 3, if all 3 tokens are same, 2 if 2 tokens are same, 1 if all 3 tokens are different
+                # #if token occurs in 2 or 3 tokens sampled from different teachers, then max_probability is max of the 2 or 3 probabilities
+                # #if token occurs in only 1 token sampled from different teachers, then max_probability is the probability of that token
+                # #if token does not occur in any token sampled from different teachers, then max_probability is 0
+      
+                # next_tokens_teacher_stacked = torch.stack(next_tokens_arr)
+                # no_of_samples = next_tokens_teacher_stacked.size(dim=0)
+                # for i in range(next_tokens_teacher_stacked.size(dim=1)):
+                #     #iterate over columns
+                #     #find unique values and counts
+                #     #find max count
+      
+                #     next_tokens_teacher_stacked_i = next_tokens_teacher_stacked[:,i]
+                #     teacher_batch = beta
+                #     prob_arr = [probs, probs_teacher2, probs_teacher3]
+                #     score_max = -1
+                #     prob = prob_arr[0]
+                #    #some modification in future to take into account all the probabilities for that token
+                #     for k in range(no_of_samples):
+             
+                #         if k % teacher_batch == 0:
+                #             prob = prob_arr[k//teacher_batch]
+    
+                #         agreement_count_k = agreement_count.get(next_tokens_teacher_stacked_i[k], 0) + 1/beta
+                #         if score(prob[i, next_tokens_teacher_stacked_i[k]],agreement_count_k) > score_max:
+                #             score_max = score(prob[i, next_tokens_teacher_stacked_i[k]], agreement_count_k)
+                #             new_next_tokens[i] = next_tokens_teacher_stacked_i[k]
+                            
+                # next_tokens = new_next_tokens.detach().clone()
+
+            # elif consensus == "batch_random":
+            #     i = torch.randint(0,3,(1,))
+
+
+
+            # if consensus == "cosine" or consensus == "batch_random": 
+            #     if i == 1:
+            #         next_tokens = next_tokens_teacher2.detach().clone()
+            #     elif i == 2:
+            #         next_tokens = next_tokens_teacher3.detach().clone()
+               
+
+
+            # finished sentences should have their next token be a padding token
+            if eos_token_id is not None:
+                if pad_token_id is None:
+                    raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+            # update generated ids, model inputs, and length for next step
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            cur_len = cur_len + 1
+            if streamer is not None:
+                streamer.put(next_tokens.cpu())
+            model_kwargs = self._update_model_kwargs_for_generation(
+                outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
+            )
+
+            model_kwargs2 = model_teacher2._update_model_kwargs_for_generation(
+                outputs2, model_kwargs2, is_encoder_decoder=self.config.is_encoder_decoder
+            )
+
+            model_kwargs3 = model_teacher3._update_model_kwargs_for_generation(
+                outputs3, model_kwargs3, is_encoder_decoder=self.config.is_encoder_decoder
+            )
+
+            # if eos_token was found in one sentence, set sentence to finished
+            if eos_token_id_tensor is not None:
+                unfinished_sequences = unfinished_sequences.mul(
+                    next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
+                )
+
+                # stop when each sentence is finished
+                if unfinished_sequences.max() == 0:
+                    this_peer_finished = True
+
+            # stop if we exceed the maximum length
+            if stopping_criteria(input_ids, scores):
+                this_peer_finished = True
+
+            if this_peer_finished and not synced_gpus:
+                break
+              #  print(consensus_hits)
+        if consensus == 'vote':
+            with open(file_name, 'w') as write_file:
+                json.dump(consensus_hits, write_file)
+            
+            with open(file_name2, 'w') as write_file:
+                json.dump(words_len, write_file)
+
+        if streamer is not None:
+            streamer.end()
+
+        if return_dict_in_generate:
+            if self.config.is_encoder_decoder:
+                return GreedySearchEncoderDecoderOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    encoder_attentions=encoder_attentions,
+                    encoder_hidden_states=encoder_hidden_states,
+                    decoder_attentions=decoder_attentions,
+                    cross_attentions=cross_attentions,
+                    decoder_hidden_states=decoder_hidden_states,
+                )
+            else:
+                return GreedySearchDecoderOnlyOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    attentions=decoder_attentions,
+                    hidden_states=decoder_hidden_states,
+                )
+        else:
+            return input_ids
+
+
     def greedy_search(
         self,
         input_ids: torch.LongTensor,
@@ -2470,9 +3052,7 @@ class GenerationMixin:
 
 
 
-
-
-
+    #not really using it right now
     def consensus_decider(
         self, 
         next_token_scores1: torch.FloatTensor,
@@ -2552,11 +3132,8 @@ class GenerationMixin:
         elif consensus == "vote": #implementing naive voting with Yuqiao's idea
             new_next_tokens = torch.zeros_like(next_tokens)
 
-
             #print("new next tokens", new_next_tokens.shape)
             next_tokens_teacher_stacked = torch.stack(next_tokens_arr)
-
-
 
             #print(next_tokens_teacher_stacked.size(dim=1))
             no_of_samples = next_tokens_teacher_stacked.size(dim=0)
@@ -2643,7 +3220,10 @@ class GenerationMixin:
     def sample_multi_teacher(
         self,
         input_ids: torch.LongTensor,
+       # input_ids_teacher2: torch.LongTensor,  #Not needed for same models
+       # input_ids_teacher3: torch.LongTensor,  #Not needed for same models
         beta: Optional[int] = 1,
+        gamma: Optional[float] = 0.5,
         no_of_teacher: Optional[int] = 3,
         model_teacher2: Optional["PreTrainedModel"] = None,
         model_teacher3: Optional["PreTrainedModel"] = None,
@@ -2660,6 +3240,8 @@ class GenerationMixin:
         return_dict_in_generate: Optional[bool] = None,
         synced_gpus: bool = False,
         streamer: Optional["BaseStreamer"] = None,
+        model_kwargs2: Dict[str, Any] = {},
+        model_kwargs3: Dict[str, Any] = {},
         **model_kwargs,
     ) -> Union[SampleOutput, torch.LongTensor]:
         r"""
@@ -2785,6 +3367,8 @@ class GenerationMixin:
         logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+
+
         if isinstance(eos_token_id, int):
             eos_token_id = [eos_token_id]
         eos_token_id_tensor = torch.tensor(eos_token_id).to(input_ids.device) if eos_token_id is not None else None
@@ -2807,12 +3391,32 @@ class GenerationMixin:
         cross_attentions = () if (return_dict_in_generate and output_attentions) else None
         decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
 
+        
+
         # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
         if return_dict_in_generate and self.config.is_encoder_decoder:
             encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
             encoder_hidden_states = (
                 model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
             )
+
+        # getting encoder hidden states and attention weights for teacher 2
+
+        #can be an added functionality for debugging in future
+        
+        # if return_dict_in_generate and model_teacher2.config.is_encoder_decoder:
+        #     encoder_attentions2 = model_kwargs2["encoder_outputs"].get("attentions") if output_attentions else None
+        #     encoder_hidden_states2 = (
+        #         model_kwargs2["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+        #     )
+        
+        # getting encoder hidden states and attention weights for teacher 3
+        # if return_dict_in_generate and model_teacher3.config.is_encoder_decoder:
+        #     encoder_attentions3 = model_kwargs3["encoder_outputs"].get("attentions") if output_attentions else None
+        #     encoder_hidden_states3 = (
+        #         model_kwargs3["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+        #     )
+        
 
         # keep track of which sequences are already finished
         unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
@@ -2828,8 +3432,7 @@ class GenerationMixin:
             try:
                 with open (file_name, "r") as myfile:
                     consensus_hits = json.loads(myfile.read())
-              #  print(consensus_hits)
-                #print("hurray")
+
             except:
                 consensus_hits = {}
 
@@ -2862,22 +3465,24 @@ class GenerationMixin:
                 output_hidden_states=output_hidden_states,
             )
             ###############################################################
+           # print(input_ids_teacher2.equal(input_ids_teacher3))
+           # print(input_ids_teacher2.equal(input_ids_teacher2))
 
-            #won't work for different architectural teacher models currently, but I can change it later
-            model2_inputs = model_teacher2.prepare_inputs_for_generation(input_ids, **model_kwargs)
-            model3_inputs = model_teacher3.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            #won't work for different architectural teacher models currently, but I can change it later :)
+            model2_inputs = model_teacher2.prepare_inputs_for_generation(input_ids, **model_kwargs2)
+            model3_inputs = model_teacher3.prepare_inputs_for_generation(input_ids, **model_kwargs3)
     
             outputs1 = model_teacher2(
             **model2_inputs,
             return_dict=True,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=model_teacher2.config.output_hidden_states,
             )
             outputs2 = model_teacher3(
             **model3_inputs,
             return_dict=True,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=model_teacher3.config.output_hidden_states,
             )
 
             if synced_gpus and this_peer_finished:
@@ -2902,8 +3507,6 @@ class GenerationMixin:
 
             next_token_scores_teacher3 = logits_processor(input_ids, next_token_logits_teacher3)
             next_token_scores_teacher3 = logits_warper(input_ids, next_token_scores_teacher3)
-
-
 
 
             ###############################
@@ -2937,31 +3540,36 @@ class GenerationMixin:
             probs_teacher3 = nn.functional.softmax(next_token_scores_teacher3, dim=-1)
             #probability check
 
-            assert(torch.all(probs <= 1))
+            # assert(torch.all(probs <= 1))
      
-
-            if consensus == "average":
+            if consensus == "average" or consensus == "average vote":
                 weighted_probs = (probs + probs_teacher2 + probs_teacher3)/3
-            
-                next_tokens = torch.multinomial(weighted_probs, num_samples=1).squeeze(1)
+                next_tokens_arr = []
+                #average vote isn't implemented yet, and even with multiple beta functionality remains same
+                for i in range(beta):
+                    next_tokens = torch.multinomial(weighted_probs, num_samples=1).squeeze(1)
+                    next_tokens_arr.append(next_tokens)
+             
+                #this lets us use voting afterwards
+                if consensus == "average vote":
+                    new_next_tokens = torch.zeros_like(next_tokens)
 
-
+                    #print("new next tokens", new_next_tokens.shape)
+                    next_tokens_teacher_stacked = torch.stack(next_tokens_arr)
+                    #to be done
 
             else:
+                #anything other than average 
 
                 next_tokens_arr = []
                 for i in range(beta):
                     next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
                     next_tokens_arr.append(next_tokens)
 
-
-
                 ########################################
    
-
                 #print (probs_teacher2)
-        
-        
+
                 #create numpy array of next tokens
 
                 for i in range(beta):
@@ -2971,7 +3579,6 @@ class GenerationMixin:
 
                 # print("teacher 2", next_tokens_teacher2.shape, probs_teacher2.shape)
 
-             
                 # assert(torch.all(probs_teacher3 <= 1))
             
                 for i in range(beta):
@@ -2979,69 +3586,32 @@ class GenerationMixin:
         
                     next_tokens_arr.append(next_tokens_teacher3)
 
-            #compute cosine similarity between next tokens to decide best next_token
-            # if consensus == "cosine":
-            #     cos_sim_teacher1_teacher2 = cos(next_tokens_teacher2, next_tokens)
-            #     cos_sim_teacher1_teacher3 = cos(next_tokens_teacher3, next_tokens)
-            #     cos_sim_teacher2_teacher3 = cos(next_tokens_teacher2, next_tokens_teacher3)
-
-            # print(next_tokens_teacher2, next_tokens_teacher3, next_tokens, type(next_tokens_teacher2), type(next_tokens_teacher3), type(next_tokens))
-
-            #find token with best similarity
-            complete_random = False
-
-            # from scipy import stats
-
-            if consensus == "cosine": #definitely need to be done at input level
-
+            if consensus == "cosine": 
+                #will be tried later
                 new_next_tokens = torch.zeros_like(next_tokens)
-
-                new_next_tokens = torch.zeros_like(next_tokens)
-                next_tokens_teacher_stacked = torch.stack(next_tokens_arr)
-                next_tokens_teacher_stacked_i = next_tokens_teacher_stacked[:,i]
-                no_of_samples = next_tokens_teacher_stacked.size(dim=0)
-                bs = next_tokens_teacher_stacked.size(dim=1)
-                for i in range(bs):
-                    cos_max = 0
-                    for j in range(no_of_samples):
-                        cos_j = 0
-                        for k in range(no_of_samples):
-                            if j == k:
-                                continue
-                            cos_j += cos(next_tokens_teacher_stacked_i[j], next_tokens_teacher_stacked_i[k])
-                        cos_j //= (no_of_samples-1)
-                        if cos_j > cos_max:
-                            cos_max = cos_j
-                            new_next_tokens[i] = next_tokens_teacher_stacked_i[j]
+                pass
                 
-                next_tokens = new_next_tokens.detach().clone()
-
             #create temp next token with same dimensions as next token
-            elif consensus == "vote": #implementing naive voting with Yuqiao's idea
+            elif consensus == "vote" or consensus == "greedy vote": #implementing naive voting with Yuqiao's idea
                 new_next_tokens = torch.zeros_like(next_tokens)
-
 
                 #print("new next tokens", new_next_tokens.shape)
                 next_tokens_teacher_stacked = torch.stack(next_tokens_arr)
-
-
-
                 #print(next_tokens_teacher_stacked.size(dim=1))
                 no_of_samples = next_tokens_teacher_stacked.size(dim=0)
                 for i in range(next_tokens_teacher_stacked.size(dim=1)):
                     #iterate over columns
                     #find unique values and counts
                     #find max count
-                   # print(next_tokens_teacher_stacked[:,i])
+
                     next_tokens_teacher_stacked_i = next_tokens_teacher_stacked[:,i]
                     unique, counts = torch.unique(next_tokens_teacher_stacked_i, return_counts=True)
-                   # print(unique, counts)
+                  
                     pos = torch.argmax(counts)
-                    
-                    #print(pos)
-                   # print(unique[pos], pos, beta*no_of_teacher//2)
+             
                     words_len[str(cur_len)] = words_len.get(str(cur_len), 0) + 1
-                    if counts[pos] > beta*no_of_teacher//2:
+
+                    if consensus == "vote" and counts[pos] > beta*no_of_teacher//2:
                         new_next_tokens[i] = unique[pos]
                 
                         y = consensus_hits.get(str(cur_len), 0)
@@ -3056,16 +3626,14 @@ class GenerationMixin:
                             #print("k", k)
                             if k % teacher_batch == 0:
                                 prob = prob_arr[k//teacher_batch]
-                       #         print("kakakakak", k)
+                
                             if prob[i, next_tokens_teacher_stacked_i[k]] > prob_max:
                                 prob_max = prob[i, next_tokens_teacher_stacked_i[k]]
                                 new_next_tokens[i] = next_tokens_teacher_stacked_i[k]
 
                 next_tokens = new_next_tokens.detach().clone()
-                        
-                            
-               # modes = torch.mode(next_tokens_teacher_stacked, dim=0)
-             #   print(modes, cur_len)
+                #modes = torch.mode(next_tokens_teacher_stacked, dim=0)
+                #print(modes, cur_len)
                 for i in range(len(next_tokens)):
                     if next_tokens[i] == next_tokens_teacher2[i] or next_tokens[i] == next_tokens_teacher3[i]:
                        # print('hit token 0')
@@ -3101,6 +3669,44 @@ class GenerationMixin:
                         new_next_tokens[i] = next_tokens[i]
                 next_tokens = new_next_tokens.detach().clone()
                 #print(next_tokens)
+            elif consensus == "score":
+                new_next_tokens = torch.zeros_like(next_tokens)
+
+                # gamma = 0.75 #can be a parameter later
+                agreement_count = dict() #keys are tokens, values are counts of agreement
+                def score(prob, agreement):
+                    return gamma*prob + (1-gamma)*agreement
+                #scoring formula for a token = gamma* max_probability + (1-gamma)* agreement
+                #agreement = 3, if all 3 tokens are same, 2 if 2 tokens are same, 1 if all 3 tokens are different
+                #if token occurs in 2 or 3 tokens sampled from different teachers, then max_probability is max of the 2 or 3 probabilities
+                #if token occurs in only 1 token sampled from different teachers, then max_probability is the probability of that token
+                #if token does not occur in any token sampled from different teachers, then max_probability is 0
+      
+                next_tokens_teacher_stacked = torch.stack(next_tokens_arr)
+                no_of_samples = next_tokens_teacher_stacked.size(dim=0)
+                for i in range(next_tokens_teacher_stacked.size(dim=1)):
+                    #iterate over columns
+                    #find unique values and counts
+                    #find max count
+      
+                    next_tokens_teacher_stacked_i = next_tokens_teacher_stacked[:,i]
+                    teacher_batch = beta
+                    prob_arr = [probs, probs_teacher2, probs_teacher3]
+                    score_max = -1
+                    prob = prob_arr[0]
+                   #some modification in future to take into account all the probabilities for that token
+                    for k in range(no_of_samples):
+             
+                        if k % teacher_batch == 0:
+                            prob = prob_arr[k//teacher_batch]
+    
+                        agreement_count_k = agreement_count.get(next_tokens_teacher_stacked_i[k], 0) + 1/beta
+                        if score(prob[i, next_tokens_teacher_stacked_i[k]],agreement_count_k) > score_max:
+                            score_max = score(prob[i, next_tokens_teacher_stacked_i[k]], agreement_count_k)
+                            new_next_tokens[i] = next_tokens_teacher_stacked_i[k]
+                            
+                next_tokens = new_next_tokens.detach().clone()
+
             elif consensus == "batch_random":
                 i = torch.randint(0,3,(1,))
 
@@ -3132,6 +3738,13 @@ class GenerationMixin:
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
 
+            model_kwargs2 = model_teacher2._update_model_kwargs_for_generation(
+                outputs1, model_kwargs2, is_encoder_decoder=self.config.is_encoder_decoder
+            )
+
+            model_kwargs3 = model_teacher3._update_model_kwargs_for_generation(
+                outputs2, model_kwargs3, is_encoder_decoder=self.config.is_encoder_decoder
+            )
             # if eos_token was found in one sentence, set sentence to finished
             if eos_token_id_tensor is not None:
                 unfinished_sequences = unfinished_sequences.mul(
@@ -3163,6 +3776,9 @@ class GenerationMixin:
 
         if return_dict_in_generate:
             if self.config.is_encoder_decoder:
+                #this is to return the hidden states and attention weights for the encoder and decoder
+                #so don't really need to do that for all teachers for now
+                #but can be done for debugging purposes
                 return SampleEncoderDecoderOutput(
                     sequences=input_ids,
                     scores=scores,
@@ -3806,6 +4422,8 @@ class GenerationMixin:
         output_scores: Optional[bool] = None,
         return_dict_in_generate: Optional[bool] = None,
         synced_gpus: bool = False,
+        model_kwargs2: Dict[str, Any] = {},
+        model_kwargs3: Dict[str, Any] = {},
         **model_kwargs,
     ) -> Union[BeamSearchOutput, torch.LongTensor]:
         r"""
@@ -3962,12 +4580,32 @@ class GenerationMixin:
         cross_attentions = () if (return_dict_in_generate and output_attentions) else None
         decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
 
+
+
         # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
         if return_dict_in_generate and self.config.is_encoder_decoder:
             encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
             encoder_hidden_states = (
                 model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
             )
+
+        # getting encoder hidden states and attention weights for teacher 2
+        #can be used in future for debugging purpose
+
+        # if return_dict_in_generate and model_teacher2.config.is_encoder_decoder:
+        #     encoder_attentions2 = model_kwargs2["encoder_outputs"].get("attentions") if output_attentions else None
+        #     encoder_hidden_states2 = (
+        #         model_kwargs2["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+        #     )
+        
+        # getting encoder hidden states and attention weights for teacher 3
+
+        # can be used in future
+        # if return_dict_in_generate and model_teacher3.config.is_encoder_decoder:
+        #     encoder_attentions3 = model_kwargs3["encoder_outputs"].get("attentions") if output_attentions else None
+        #     encoder_hidden_states3 = (
+        #         model_kwargs3["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+        #     )
 
         # initialise score of first beam with 0 and the rest with -1e9. This makes sure that only tokens
         # of the first beam are considered to avoid sampling the exact same tokens across all beams.
@@ -3988,30 +4626,37 @@ class GenerationMixin:
                     break
 
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-            model2_inputs = model_teacher2.prepare_inputs_for_generation(input_ids, **model_kwargs)
-            model3_inputs = model_teacher3.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            model2_inputs = model_teacher2.prepare_inputs_for_generation(input_ids, **model_kwargs2)
+            model3_inputs = model_teacher3.prepare_inputs_for_generation(input_ids, **model_kwargs3)
+
+
 
 
             ##works for now as I am using same architecture for all models
-            outputs1 = model_teacher2(
-            **model2_inputs,
-            return_dict=True,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            )
-            outputs2 = model_teacher3(
-            **model3_inputs,
-            return_dict=True,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            )
-
             outputs = self(
                 **model_inputs,
                 return_dict=True,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
             )
+
+
+            outputs1 = model_teacher2(
+            **model2_inputs,
+            return_dict=True,
+            output_attentions=output_attentions,
+            output_hidden_states=model_teacher2.config.output_hidden_states,
+            )
+
+            #issue is in model2_inputs
+            outputs2 = model_teacher3(
+            **model3_inputs,
+            return_dict=True,
+            output_attentions=output_attentions,
+            output_hidden_states=model_teacher3.config.output_hidden_states,
+            )
+
+        
 
             if synced_gpus and this_peer_finished:
                 cur_len = cur_len + 1
@@ -4022,6 +4667,8 @@ class GenerationMixin:
             # cannot be generated both before and after the `nn.functional.log_softmax` operation.
             next_token_logits_teacher2 = outputs1.logits[:, -1, :]
             next_token_logits_teacher3 = outputs2.logits[:, -1, :]
+            
+ 
 
             next_token_logits_teacher2 = self.adjust_logits_during_generation(next_token_logits_teacher2, cur_len=cur_len)
             next_token_logits_teacher3 = self.adjust_logits_during_generation(next_token_logits_teacher3, cur_len=cur_len)
@@ -4038,6 +4685,10 @@ class GenerationMixin:
             next_token_scores_teacher3 = nn.functional.log_softmax(
                 next_token_logits_teacher3, dim=-1
             )
+            
+            #next token scores are softmax soft probabilities
+            if consensus == "average":
+                next_token_scores = (next_token_scores + next_token_scores_teacher2 + next_token_scores_teacher3)/3
 
             next_token_scores_processed = logits_processor(input_ids, next_token_scores)
             next_token_scores = next_token_scores_processed + beam_scores[:, None].expand_as(next_token_scores)
@@ -4213,6 +4864,9 @@ class GenerationMixin:
                 #print(next_tokens)
             elif consensus == "batch_random":
                 i = torch.randint(0,3,(1,))
+
+
+            #now beam_next_tokens should be from the ensemble if consensus is average
 
 
             #need to make cosine consensus input level
