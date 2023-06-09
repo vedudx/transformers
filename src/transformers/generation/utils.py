@@ -1356,11 +1356,11 @@ class GenerationMixin:
                 bos_token_id=generation_config.bos_token_id,
                 device=inputs_tensor.device,
             )
-
+        
             if model_teacher2 and model_teacher3:
                 #added by Vedant. This code won't work for different models
                 #input_ids2, model_kwargs2 = self._prepare_decoder_input_ids_for_generation(
-                _, model_kwargs2 = model_teacher2._prepare_decoder_input_ids_for_generation(
+                input_ids2, model_kwargs2 = model_teacher2._prepare_decoder_input_ids_for_generation(
                     batch_size=batch_size,
                     model_input_name=model_input_name,
                     model_kwargs=model_kwargs2,
@@ -1369,7 +1369,7 @@ class GenerationMixin:
                     device=inputs_tensor.device,
                 )
                 #input_ids3, model_kwargs3 = self._prepare_decoder_input_ids_for_generation(
-                _, model_kwargs3 = model_teacher3._prepare_decoder_input_ids_for_generation(
+                input_ids3, model_kwargs3 = model_teacher3._prepare_decoder_input_ids_for_generation(
                     batch_size=batch_size,
                     model_input_name=model_input_name,
                     model_kwargs=model_kwargs3,
@@ -1377,6 +1377,21 @@ class GenerationMixin:
                     bos_token_id=generation_config.bos_token_id,
                     device=inputs_tensor.device,
                 )
+                #should be the case for same architecture as decoder_start_token_id is same
+                assert torch.all(input_ids==input_ids2)
+                assert torch.all(input_ids==input_ids3)
+
+                #print(type(model_kwargs['encoder_outputs'].to_tuple()))
+            
+                encoder_output1 = model_kwargs['encoder_outputs'].to_tuple()[0].cpu()
+                
+                encoder_output2 = model_kwargs2['encoder_outputs'].to_tuple()[0].cpu()
+
+                encoder_output3 = model_kwargs3['encoder_outputs'].to_tuple()[0].cpu()
+             
+                #print(torch.equal(encoder_output1, encoder_output2), torch.equal(encoder_output1, encoder_output3))
+
+                #print("input_ids comparison", torch.all(input_ids==input_ids2), torch.all(input_ids==input_ids3))
 
         else:
             input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
@@ -1498,6 +1513,7 @@ class GenerationMixin:
                 UserWarning,
             )
 
+        #currently works as we have same architecture for all teachers
         # 8. prepare distribution pre_processing samplers
         logits_processor = self._get_logits_processor(
             generation_config=generation_config,
@@ -1562,7 +1578,7 @@ class GenerationMixin:
                 return self.greedy_search_multi_teacher(
                     input_ids,
                     consensus=consensus,
-                    no_of_teacher=3,
+                    no_of_teacher=3,  #hard coded to be changed
                     gamma=gamma,
                     model_teacher2=model_teacher2,
                     model_teacher3=model_teacher3,
@@ -1644,8 +1660,6 @@ class GenerationMixin:
                 is_encoder_decoder=model_teacher3.config.is_encoder_decoder,
                 **model_kwargs3,
             )
-
-
 
 
             # 13. run sample
@@ -2431,6 +2445,7 @@ class GenerationMixin:
         ["It might be possible to get a better understanding of the nature of the problem, but it's not"]
         ```"""
         # init values
+   
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
         if max_length is not None:
@@ -2457,6 +2472,8 @@ class GenerationMixin:
             if return_dict_in_generate is not None
             else self.generation_config.return_dict_in_generate
         )
+
+        #assert beta==1, "beta must be 1 for greedy search with ensemble"
 
         # init attention / hidden states / scores tuples
         scores = () if (return_dict_in_generate and output_scores) else None
@@ -2524,16 +2541,25 @@ class GenerationMixin:
             outputs2 = model_teacher2(
                 **model_inputs2,
                 return_dict=True,
-                output_attentions=model_teacher2.config.output_attentions,
-                output_hidden_states=model_teacher2.config.output_hidden_states,
+                output_attentions=False,#model_teacher2.config.output_attentions,
+                output_hidden_states=False,#model_teacher2.config.output_hidden_states,
             )
 
+            # outputs2 = model_teacher2(
+            #     decoder_input_ids=model_inputs2["decoder_input_ids"],
+            #     encoder_outputs=model_kwargs2["encoder_outputs"],
+            #     return_dict=True,
+            #     output_attentions=False,#model_teacher2.config.output_attentions,
+            #     output_hidden_states=False,#model_teacher2.config.output_hidden_states,
+            # )
+
             #forward pass to get next token for teacher 3
+
             outputs3 = model_teacher3(
                 **model_inputs3,
                 return_dict=True,
-                output_attentions=model_teacher3.config.output_attentions,
-                output_hidden_states=model_teacher3.config.output_hidden_states,
+                output_attentions=False,#model_teacher3.config.output_attentions,
+                output_hidden_states=False,#model_teacher3.config.output_hidden_states,
             )
 
             if synced_gpus and this_peer_finished:
@@ -2544,6 +2570,14 @@ class GenerationMixin:
             next_token_logits3 = outputs3.logits[:, -1, :]
 
 
+
+            #assertion check
+            assert not torch.equal(next_token_logits, next_token_logits2), "teacher 1 and 2 are same"
+            assert not torch.equal(next_token_logits, next_token_logits3), "teacher 1 and 3 are same"
+            assert not torch.equal(next_token_logits2, next_token_logits3), "teacher 2 and 3 are same"
+
+
+            #Need to take a closer look at logits_processor
             # pre-process distribution
             next_tokens_scores = logits_processor(input_ids, next_token_logits)
 
@@ -2572,30 +2606,33 @@ class GenerationMixin:
                         else (outputs.hidden_states,)
                     )
 
-            # argmax
             next_tokens = torch.argmax(next_tokens_scores, dim=-1)
-            next_tokens2 = torch.argmax(next_tokens_scores2, dim=-1)
-            next_tokens3 = torch.argmax(next_tokens_scores3, dim=-1)
+
+            print(next_tokens_scores.shape)
+          
+          #  print(torch.equal(next_tokens, next_tokens2) and torch.equal(next_tokens,next_tokens3))
 
             #perform consensus
 
             if consensus == "average" or consensus == "average vote":
-                pass
-                # weighted_probs = (probs + probs_teacher2 + probs_teacher3)/3
-                # next_tokens_arr = []
-                # #average vote isn't implemented yet, and even with multiple beta functionality remains same
-                # for i in range(beta):
-                #     next_tokens = torch.multinomial(weighted_probs, num_samples=1).squeeze(1)
-                #     next_tokens_arr.append(next_tokens)
-             
-                # #this lets us use voting afterwards
-                # if consensus == "average vote":
-                #     new_next_tokens = torch.zeros_like(next_tokens)
+                probs = torch.nn.functional.softmax(next_tokens_scores, dim=-1)
+                probs2 = torch.nn.functional.softmax(next_tokens_scores2, dim=-1)
+                probs3 = torch.nn.functional.softmax(next_tokens_scores3, dim=-1)
+                assert(probs.shape == probs2.shape == probs3.shape)
 
 
-                #     #print("new next tokens", new_next_tokens.shape)
-                #     next_tokens_teacher_stacked = torch.stack(next_tokens_arr)
-                #     #to be done
+                #avoid the case of decoder start token
+                if not sum(probs[:,0]) == probs.shape[0]:
+                    assert not torch.equal(probs, probs2), "teacher 1 and 2 have same probs"
+                    assert not torch.equal(probs, probs3), "teacher 1 and 3 have same probs"
+                    assert not torch.equal(probs2, probs3), "teacher 2 and 3 have same probs"
+     
+                avg_probs = (probs + probs2 + probs3)/3
+                next_tokens = torch.argmax(avg_probs, dim=-1)
+
+            else:
+                next_tokens2 = torch.argmax(next_tokens_scores2, dim=-1)
+                next_tokens3 = torch.argmax(next_tokens_scores3, dim=-1)
 
 
             # from scipy import stats
@@ -2621,33 +2658,35 @@ class GenerationMixin:
                     #find unique values and counts
                     #find max count
                     next_tokens_teacher_stacked_i = next_tokens_teacher_stacked[:,i]
+                  #  print(next_tokens_teacher_stacked_i)
                     unique, counts = torch.unique(next_tokens_teacher_stacked_i, return_counts=True)
-                   # print(unique, counts)
+                    print(unique, counts)
                     pos = torch.argmax(counts)
 
                     #for now
                     no_of_teacher = 3
                     words_len[str(cur_len)] = words_len.get(str(cur_len), 0) + 1
                     if consensus == "vote" and counts[pos] > no_of_teacher//2:
+                       # print(unique[pos])
                         new_next_tokens[i] = unique[pos]
                 
                         y = consensus_hits.get(str(cur_len), 0)
             
                         consensus_hits[str(cur_len)] = y + 1
                     else:
-                        new_next_tokens[i] = torch.max(next_tokens_teacher_stacked_i)
-                    #     teacher_batch = beta
-                    #     prob_arr = [probs, probs_teacher2, probs_teacher3]
-                    #     prob_max = -1
-                    #     prob = prob_arr[0]
-                    #     for k in range(no_of_samples):
-                    #         #print("k", k)
-                    #         if k % teacher_batch == 0:
-                    #             prob = prob_arr[k//teacher_batch]
-                    #    #         print("kakakakak", k)
-                    #         if prob[i, next_tokens_teacher_stacked_i[k]] > prob_max:
-                    #             prob_max = prob[i, next_tokens_teacher_stacked_i[k]]
-                    #             new_next_tokens[i] = next_tokens_teacher_stacked_i[k]
+                        #new_next_tokens[i] = torch.max(next_tokens_teacher_stacked_i)
+                        teacher_batch = 1
+                        scores_arr = [next_tokens_scores,next_tokens_scores2, next_tokens_scores3]
+                        scores_max = -1
+                        score = scores_arr[0]
+                        for k in range(no_of_samples):
+                            #print("k", k)
+                            if k % teacher_batch == 0:
+                                score = scores_arr[k//teacher_batch]
+                       #         print("kakakakak", k)
+                            if score[i, next_tokens_teacher_stacked_i[k]] > scores_max:
+                                scores_max = score[i, next_tokens_teacher_stacked_i[k]]
+                                new_next_tokens[i] = next_tokens_teacher_stacked_i[k]
 
                 next_tokens = new_next_tokens.detach().clone()
             elif consensus == "random":
@@ -3072,147 +3111,149 @@ class GenerationMixin:
                 no_of_teacher: the number of teachers
                 consensus: the consensus method to be used
         """
+
+        pass
                     # sample
-        probs = nn.functional.softmax(next_token_scores, dim=-1)
-        probs_teacher2 = nn.functional.softmax(next_token_scores_teacher2, dim=-1)
-        probs_teacher3 = nn.functional.softmax(next_token_scores_teacher3, dim=-1)
-        if consensus == "average":
-            weighted_probs = (probs + probs_teacher2 + probs_teacher3)/3
-            next_tokens = torch.multinomial(weighted_probs, num_samples=1).squeeze(1)
-        else:
-            next_tokens_arr = []
-            for i in range(beta):
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-                next_tokens_arr.append(next_tokens)
+        # probs = nn.functional.softmax(next_token_scores1, dim=-1)
+        # probs_teacher2 = nn.functional.softmax(next_token_scores_teacher2, dim=-1)
+        # probs_teacher3 = nn.functional.softmax(next_token_scores_teacher3, dim=-1)
+        # if consensus == "average":
+        #     weighted_probs = (probs + probs_teacher2 + probs_teacher3)/3
+        #     next_tokens = torch.multinomial(weighted_probs, num_samples=1).squeeze(1)
+        # else:
+        #     next_tokens_arr = []
+        #     for i in range(beta):
+        #         next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        #         next_tokens_arr.append(next_tokens)
 
-            ########################################
-            #create numpy array of next tokens
+        #     ########################################
+        #     #create numpy array of next tokens
 
-            for i in range(beta):
-                next_tokens_teacher2 = torch.multinomial(probs_teacher2, num_samples=1).squeeze(1)
+        #     for i in range(beta):
+        #         next_tokens_teacher2 = torch.multinomial(probs_teacher2, num_samples=1).squeeze(1)
         
-                next_tokens_arr.append(next_tokens_teacher2)
+        #         next_tokens_arr.append(next_tokens_teacher2)
 
         
-            for i in range(beta):
-                next_tokens_teacher3 = torch.multinomial(probs_teacher3, num_samples=1).squeeze(1)
+        #     for i in range(beta):
+        #         next_tokens_teacher3 = torch.multinomial(probs_teacher3, num_samples=1).squeeze(1)
     
-                next_tokens_arr.append(next_tokens_teacher3)
+        #         next_tokens_arr.append(next_tokens_teacher3)
 
-        #find token with best similarity
-        complete_random = False
+        # #find token with best similarity
+        # complete_random = False
 
-        # from scipy import stats
+        # # from scipy import stats
 
-        if consensus == "cosine": #definitely need to be done at input level
+        # if consensus == "cosine": #definitely need to be done at input level
 
-            new_next_tokens = torch.zeros_like(next_tokens)
+        #     new_next_tokens = torch.zeros_like(next_tokens)
 
-            new_next_tokens = torch.zeros_like(next_tokens)
-            next_tokens_teacher_stacked = torch.stack(next_tokens_arr)
-            next_tokens_teacher_stacked_i = next_tokens_teacher_stacked[:,i]
-            no_of_samples = next_tokens_teacher_stacked.size(dim=0)
-            bs = next_tokens_teacher_stacked.size(dim=1)
-            for i in range(bs):
-                cos_max = 0
-                for j in range(no_of_samples):
-                    cos_j = 0
-                    for k in range(no_of_samples):
-                        if j == k:
-                            continue
-                        cos_j += cos(next_tokens_teacher_stacked_i[j], next_tokens_teacher_stacked_i[k])
-                    cos_j //= (no_of_samples-1)
-                    if cos_j > cos_max:
-                        cos_max = cos_j
-                        new_next_tokens[i] = next_tokens_teacher_stacked_i[j]
+        #     new_next_tokens = torch.zeros_like(next_tokens)
+        #     next_tokens_teacher_stacked = torch.stack(next_tokens_arr)
+        #     next_tokens_teacher_stacked_i = next_tokens_teacher_stacked[:,i]
+        #     no_of_samples = next_tokens_teacher_stacked.size(dim=0)
+        #     bs = next_tokens_teacher_stacked.size(dim=1)
+        #     for i in range(bs):
+        #         cos_max = 0
+        #         for j in range(no_of_samples):
+        #             cos_j = 0
+        #             for k in range(no_of_samples):
+        #                 if j == k:
+        #                     continue
+        #                 cos_j += cos(next_tokens_teacher_stacked_i[j], next_tokens_teacher_stacked_i[k])
+        #             cos_j //= (no_of_samples-1)
+        #             if cos_j > cos_max:
+        #                 cos_max = cos_j
+        #                 new_next_tokens[i] = next_tokens_teacher_stacked_i[j]
             
-            next_tokens = new_next_tokens.detach().clone()
+        #     next_tokens = new_next_tokens.detach().clone()
 
-        #create temp next token with same dimensions as next token
-        elif consensus == "vote": #implementing naive voting with Yuqiao's idea
-            new_next_tokens = torch.zeros_like(next_tokens)
+        # #create temp next token with same dimensions as next token
+        # elif consensus == "vote": #implementing naive voting with Yuqiao's idea
+        #     new_next_tokens = torch.zeros_like(next_tokens)
 
-            #print("new next tokens", new_next_tokens.shape)
-            next_tokens_teacher_stacked = torch.stack(next_tokens_arr)
+        #     #print("new next tokens", new_next_tokens.shape)
+        #     next_tokens_teacher_stacked = torch.stack(next_tokens_arr)
 
-            #print(next_tokens_teacher_stacked.size(dim=1))
-            no_of_samples = next_tokens_teacher_stacked.size(dim=0)
-            for i in range(next_tokens_teacher_stacked.size(dim=1)):
-                next_tokens_teacher_stacked_i = next_tokens_teacher_stacked[:,i]
-                unique, counts = torch.unique(next_tokens_teacher_stacked_i, return_counts=True)
-                # print(unique, counts)
-                pos = torch.argmax(counts)
+        #     #print(next_tokens_teacher_stacked.size(dim=1))
+        #     no_of_samples = next_tokens_teacher_stacked.size(dim=0)
+        #     for i in range(next_tokens_teacher_stacked.size(dim=1)):
+        #         next_tokens_teacher_stacked_i = next_tokens_teacher_stacked[:,i]
+        #         unique, counts = torch.unique(next_tokens_teacher_stacked_i, return_counts=True)
+        #         # print(unique, counts)
+        #         pos = torch.argmax(counts)
                 
-                words_len[str(cur_len)] = words_len.get(str(cur_len), 0) + 1
-                if counts[pos] > beta*no_of_teacher//2:
-                    new_next_tokens[i] = unique[pos]
+        #         words_len[str(cur_len)] = words_len.get(str(cur_len), 0) + 1
+        #         if counts[pos] > beta*no_of_teacher//2:
+        #             new_next_tokens[i] = unique[pos]
             
-                    y = consensus_hits.get(str(cur_len), 0)
+        #             y = consensus_hits.get(str(cur_len), 0)
         
-                    consensus_hits[str(cur_len)] = y + 1
-                else:
-                    teacher_batch = beta
-                    prob_arr = [probs, probs_teacher2, probs_teacher3]
-                    prob_max = -1
-                    prob = prob_arr[0]
-                    for k in range(no_of_samples):
-                        #print("k", k)
-                        if k % teacher_batch == 0:
-                            prob = prob_arr[k//teacher_batch]
-                    #         print("kakakakak", k)
-                        if prob[i, next_tokens_teacher_stacked_i[k]] > prob_max:
-                            prob_max = prob[i, next_tokens_teacher_stacked_i[k]]
-                            new_next_tokens[i] = next_tokens_teacher_stacked_i[k]
+        #             consensus_hits[str(cur_len)] = y + 1
+        #         else:
+        #             teacher_batch = beta
+        #             prob_arr = [probs, probs_teacher2, probs_teacher3]
+        #             prob_max = -1
+        #             prob = prob_arr[0]
+        #             for k in range(no_of_samples):
+        #                 #print("k", k)
+        #                 if k % teacher_batch == 0:
+        #                     prob = prob_arr[k//teacher_batch]
+        #             #         print("kakakakak", k)
+        #                 if prob[i, next_tokens_teacher_stacked_i[k]] > prob_max:
+        #                     prob_max = prob[i, next_tokens_teacher_stacked_i[k]]
+        #                     new_next_tokens[i] = next_tokens_teacher_stacked_i[k]
 
-            next_tokens = new_next_tokens.detach().clone()
+        #     next_tokens = new_next_tokens.detach().clone()
                     
                         
-            # modes = torch.mode(next_tokens_teacher_stacked, dim=0)
-            #   print(modes, cur_len)
-            for i in range(len(next_tokens)):
-                if next_tokens[i] == next_tokens_teacher2[i] or next_tokens[i] == next_tokens_teacher3[i]:
-                    # print('hit token 0')
-                    new_next_tokens[i] = next_tokens[i]
-                elif next_tokens_teacher2[i] == next_tokens_teacher3[i]:
-                    # print('hit token 1')
-                    new_next_tokens[i] = next_tokens_teacher2[i]
-                else:
-                    # print(type(next_tokens[i]), next_tokens[i], next_tokens[i].shape, next_tokens.shape)
-                    probability_tokens = torch.FloatTensor([probs[i, next_tokens[i]], probs_teacher2[i, next_tokens_teacher2[i]], probs_teacher3[i, next_tokens_teacher3[i]]])
-                    #print(probability_tokens)
-                    k = torch.argmax(probability_tokens)
-                    if k == 1:
-                        new_next_tokens[i] = next_tokens_teacher2[i]
-                    elif k == 2:
-                        new_next_tokens[i] = next_tokens_teacher3[i]
-                    else:
-                        new_next_tokens[i] = next_tokens[i]
-            next_tokens = new_next_tokens.detach().clone()
-        elif consensus == "random":
-            #create a new tensor by randomly selecting values from the 3 tensors
-            new_next_tokens = torch.zeros_like(next_tokens)
-            complete_random = True
-            #  print(len(next_tokens))
-            for i in range(len(next_tokens)):
-                j = torch.randint(0,3,(1,))
-                #print(i)
-                if j == 1:
-                    new_next_tokens[i] = next_tokens_teacher2[i]
-                elif j == 2:
-                    new_next_tokens[i] = next_tokens_teacher3[i]
-                else:
-                    new_next_tokens[i] = next_tokens[i]
-            next_tokens = new_next_tokens.detach().clone()
-            #print(next_tokens)
-        elif consensus == "batch_random":
-            i = torch.randint(0,3,(1,))
+        #     # modes = torch.mode(next_tokens_teacher_stacked, dim=0)
+        #     #   print(modes, cur_len)
+        #     for i in range(len(next_tokens)):
+        #         if next_tokens[i] == next_tokens_teacher2[i] or next_tokens[i] == next_tokens_teacher3[i]:
+        #             # print('hit token 0')
+        #             new_next_tokens[i] = next_tokens[i]
+        #         elif next_tokens_teacher2[i] == next_tokens_teacher3[i]:
+        #             # print('hit token 1')
+        #             new_next_tokens[i] = next_tokens_teacher2[i]
+        #         else:
+        #             # print(type(next_tokens[i]), next_tokens[i], next_tokens[i].shape, next_tokens.shape)
+        #             probability_tokens = torch.FloatTensor([probs[i, next_tokens[i]], probs_teacher2[i, next_tokens_teacher2[i]], probs_teacher3[i, next_tokens_teacher3[i]]])
+        #             #print(probability_tokens)
+        #             k = torch.argmax(probability_tokens)
+        #             if k == 1:
+        #                 new_next_tokens[i] = next_tokens_teacher2[i]
+        #             elif k == 2:
+        #                 new_next_tokens[i] = next_tokens_teacher3[i]
+        #             else:
+        #                 new_next_tokens[i] = next_tokens[i]
+        #     next_tokens = new_next_tokens.detach().clone()
+        # elif consensus == "random":
+        #     #create a new tensor by randomly selecting values from the 3 tensors
+        #     new_next_tokens = torch.zeros_like(next_tokens)
+        #     complete_random = True
+        #     #  print(len(next_tokens))
+        #     for i in range(len(next_tokens)):
+        #         j = torch.randint(0,3,(1,))
+        #         #print(i)
+        #         if j == 1:
+        #             new_next_tokens[i] = next_tokens_teacher2[i]
+        #         elif j == 2:
+        #             new_next_tokens[i] = next_tokens_teacher3[i]
+        #         else:
+        #             new_next_tokens[i] = next_tokens[i]
+        #     next_tokens = new_next_tokens.detach().clone()
+        #     #print(next_tokens)
+        # elif consensus == "batch_random":
+        #     i = torch.randint(0,3,(1,))
 
-        if consensus == "cosine" or consensus == "batch_random": 
-            if i == 1:
-                next_tokens = next_tokens_teacher2.detach().clone()
-            elif i == 2:
-                next_tokens = next_tokens_teacher3.detach().clone()
-        return next_tokens
+        # if consensus == "cosine" or consensus == "batch_random": 
+        #     if i == 1:
+        #         next_tokens = next_tokens_teacher2.detach().clone()
+        #     elif i == 2:
+        #         next_tokens = next_tokens_teacher3.detach().clone()
+        # return next_tokens
                
 
 
@@ -3475,14 +3516,14 @@ class GenerationMixin:
             outputs1 = model_teacher2(
             **model2_inputs,
             return_dict=True,
-            output_attentions=output_attentions,
-            output_hidden_states=model_teacher2.config.output_hidden_states,
+            output_attentions=False,#output_attentions,
+            output_hidden_states=False,#model_teacher2.config.output_hidden_states,
             )
             outputs2 = model_teacher3(
             **model3_inputs,
             return_dict=True,
-            output_attentions=output_attentions,
-            output_hidden_states=model_teacher3.config.output_hidden_states,
+            output_attentions=False,#output_attentions,
+            output_hidden_states=False,#model_teacher3.config.output_hidden_states,
             )
 
             if synced_gpus and this_peer_finished:
@@ -3539,8 +3580,6 @@ class GenerationMixin:
             probs_teacher2 = nn.functional.softmax(next_token_scores_teacher2, dim=-1)
             probs_teacher3 = nn.functional.softmax(next_token_scores_teacher3, dim=-1)
             #probability check
-
-            # assert(torch.all(probs <= 1))
      
             if consensus == "average" or consensus == "average vote":
                 weighted_probs = (probs + probs_teacher2 + probs_teacher3)/3
@@ -3634,25 +3673,25 @@ class GenerationMixin:
                 next_tokens = new_next_tokens.detach().clone()
                 #modes = torch.mode(next_tokens_teacher_stacked, dim=0)
                 #print(modes, cur_len)
-                for i in range(len(next_tokens)):
-                    if next_tokens[i] == next_tokens_teacher2[i] or next_tokens[i] == next_tokens_teacher3[i]:
-                       # print('hit token 0')
-                        new_next_tokens[i] = next_tokens[i]
-                    elif next_tokens_teacher2[i] == next_tokens_teacher3[i]:
-                       # print('hit token 1')
-                        new_next_tokens[i] = next_tokens_teacher2[i]
-                    else:
-                       # print(type(next_tokens[i]), next_tokens[i], next_tokens[i].shape, next_tokens.shape)
-                        probability_tokens = torch.FloatTensor([probs[i, next_tokens[i]], probs_teacher2[i, next_tokens_teacher2[i]], probs_teacher3[i, next_tokens_teacher3[i]]])
-                        #print(probability_tokens)
-                        k = torch.argmax(probability_tokens)
-                        if k == 1:
-                            new_next_tokens[i] = next_tokens_teacher2[i]
-                        elif k == 2:
-                            new_next_tokens[i] = next_tokens_teacher3[i]
-                        else:
-                            new_next_tokens[i] = next_tokens[i]
-                next_tokens = new_next_tokens.detach().clone()
+                # for i in range(len(next_tokens)):
+                #     if next_tokens[i] == next_tokens_teacher2[i] or next_tokens[i] == next_tokens_teacher3[i]:
+                #        # print('hit token 0')
+                #         new_next_tokens[i] = next_tokens[i]
+                #     elif next_tokens_teacher2[i] == next_tokens_teacher3[i]:
+                #        # print('hit token 1')
+                #         new_next_tokens[i] = next_tokens_teacher2[i]
+                #     else:
+                #        # print(type(next_tokens[i]), next_tokens[i], next_tokens[i].shape, next_tokens.shape)
+                #         probability_tokens = torch.FloatTensor([probs[i, next_tokens[i]], probs_teacher2[i, next_tokens_teacher2[i]], probs_teacher3[i, next_tokens_teacher3[i]]])
+                #         #print(probability_tokens)
+                #         k = torch.argmax(probability_tokens)
+                #         if k == 1:
+                #             new_next_tokens[i] = next_tokens_teacher2[i]
+                #         elif k == 2:
+                #             new_next_tokens[i] = next_tokens_teacher3[i]
+                #         else:
+                #             new_next_tokens[i] = next_tokens[i]
+                # next_tokens = new_next_tokens.detach().clone()
             elif consensus == "random":
                 #create a new tensor by randomly selecting values from the 3 tensors
                 new_next_tokens = torch.zeros_like(next_tokens)
@@ -4613,6 +4652,15 @@ class GenerationMixin:
         beam_scores[:, 1:] = -1e9
         beam_scores = beam_scores.view((batch_size * num_beams,))
 
+
+        beam_scores_teacher2 = torch.zeros((batch_size, num_beams), dtype=torch.float, device=input_ids.device)
+        beam_scores_teacher2[:, 1:] = -1e9
+        beam_scores_teacher2 = beam_scores_teacher2.view((batch_size * num_beams,))
+
+        beam_scores_teacher3 = torch.zeros((batch_size, num_beams), dtype=torch.float, device=input_ids.device)
+        beam_scores_teacher3[:, 1:] = -1e9
+        beam_scores_teacher3 = beam_scores_teacher3.view((batch_size * num_beams,))
+
         this_peer_finished = False  # used by synced_gpus only
         while True:
             if synced_gpus:
@@ -4644,19 +4692,17 @@ class GenerationMixin:
             outputs1 = model_teacher2(
             **model2_inputs,
             return_dict=True,
-            output_attentions=output_attentions,
-            output_hidden_states=model_teacher2.config.output_hidden_states,
+            output_attentions=False, #model_teacher2.generation_config.output_attentions,
+            output_hidden_states=False, #model_teacher2.generation_config.output_hidden_states,
             )
 
             #issue is in model2_inputs
             outputs2 = model_teacher3(
             **model3_inputs,
             return_dict=True,
-            output_attentions=output_attentions,
-            output_hidden_states=model_teacher3.config.output_hidden_states,
+            output_attentions=False, #model_teacher2.generation_config.output_attentions,
+            output_hidden_states=False, #model_teacher3.generation_config.output_hidden_states,
             )
-
-        
 
             if synced_gpus and this_peer_finished:
                 cur_len = cur_len + 1
@@ -4668,10 +4714,8 @@ class GenerationMixin:
             next_token_logits_teacher2 = outputs1.logits[:, -1, :]
             next_token_logits_teacher3 = outputs2.logits[:, -1, :]
             
- 
-
-            next_token_logits_teacher2 = self.adjust_logits_during_generation(next_token_logits_teacher2, cur_len=cur_len)
-            next_token_logits_teacher3 = self.adjust_logits_during_generation(next_token_logits_teacher3, cur_len=cur_len)
+            next_token_logits_teacher2 = model_teacher2.adjust_logits_during_generation(next_token_logits_teacher2, cur_len=cur_len)
+            next_token_logits_teacher3 = model_teacher3.adjust_logits_during_generation(next_token_logits_teacher3, cur_len=cur_len)
 
 
             next_token_logits = self.adjust_logits_during_generation(next_token_logits, cur_len=cur_len)
@@ -4686,18 +4730,35 @@ class GenerationMixin:
                 next_token_logits_teacher3, dim=-1
             )
             
+            #Added by Vedant
+            #subtract argmax from logits and then apply softmax
+            next_token_logits = next_token_logits - torch.max(next_token_logits)
+            next_token_logits_teacher2 = next_token_logits_teacher2 - torch.max(next_token_logits_teacher2)
+            next_token_logits_teacher3 = next_token_logits_teacher3 - torch.max(next_token_logits_teacher3)
+
+            next_token_scores_1_softmax = nn.functional.softmax(next_token_logits, dim=-1)
+            next_token_scores_2_softmax = nn.functional.softmax(next_token_logits_teacher2, dim=-1)
+            next_token_scores_3_softmax = nn.functional.softmax(next_token_logits_teacher3, dim=-1)
+
             #next token scores are softmax soft probabilities
             if consensus == "average":
-                next_token_scores = (next_token_scores + next_token_scores_teacher2 + next_token_scores_teacher3)/3
+                #maybe remove max from logits and then use softmax followed by log
+                next_token_scores_softmax = (next_token_scores_1_softmax + next_token_scores_2_softmax + next_token_scores_3_softmax)/3
+
+                #next_token_scores = (next_token_scores + next_token_scores_teacher2 + next_token_scores_teacher3)/3 #not what we want
+                #apply log to softmax
+                next_token_scores = torch.log(next_token_scores_softmax).detach().clone()
+                #next_token_scores = next_token_scores_softmax.detach().clone()
+            
 
             next_token_scores_processed = logits_processor(input_ids, next_token_scores)
             next_token_scores = next_token_scores_processed + beam_scores[:, None].expand_as(next_token_scores)
 
             next_token_scores_teacher2_processed = logits_processor(input_ids, next_token_scores_teacher2)
-            next_token_scores_teacher2 = next_token_scores_teacher2_processed + beam_scores[:, None].expand_as(next_token_scores_teacher2)
+            next_token_scores_teacher2 = next_token_scores_teacher2_processed + beam_scores_teacher2[:, None].expand_as(next_token_scores_teacher2)
 
             next_token_scores_teacher3_processed = logits_processor(input_ids, next_token_scores_teacher3)
-            next_token_scores_teacher3 = next_token_scores_teacher3_processed + beam_scores[:, None].expand_as(next_token_scores_teacher3)
+            next_token_scores_teacher3 = next_token_scores_teacher3_processed + beam_scores_teacher3[:, None].expand_as(next_token_scores_teacher3)
 
 
             # Store scores, attentions and hidden_states when required
@@ -4744,9 +4805,9 @@ class GenerationMixin:
                 next_token_scores_teacher3, 2 * num_beams, dim=1, largest=True, sorted=True
             )
 
-            probs = nn.functional.softmax(next_token_scores, dim=-1)
-            probs_teacher2 = nn.functional.softmax(next_token_scores_teacher2, dim=-1)
-            probs_teacher3 = nn.functional.softmax(next_token_scores_teacher3, dim=-1)
+            probs =    next_token_scores_1_softmax.detach().clone()                  #nn.functional.softmax(next_token_scores, dim=-1)
+            probs_teacher2 =  next_token_scores_2_softmax.detach().clone()           #nn.functional.softmax(next_token_scores_teacher2, dim=-1)
+            probs_teacher3 =  next_token_scores_3_softmax.detach().clone()           #nn.functional.softmax(next_token_scores_teacher3, dim=-1)
 
             next_indices = torch.div(next_tokens, vocab_size, rounding_mode="floor")
             next_tokens = next_tokens % vocab_size
@@ -4814,8 +4875,6 @@ class GenerationMixin:
                 cos_sim_teacher1_teacher3 = cos(beam_next_tokens_teacher3, beam_next_tokens)
                 cos_sim_teacher2_teacher3 = cos(beam_next_tokens_teacher2, beam_next_tokens_teacher3)
 
-            # print(next_tokens_teacher2, next_tokens_teacher3, next_tokens, type(next_tokens_teacher2), type(next_tokens_teacher3), type(next_tokens))
-
             #find token with best similarity
             complete_random = False
 
@@ -4835,9 +4894,9 @@ class GenerationMixin:
                        # print('hit token 1')
                         new_beam_next_tokens[i] = beam_next_tokens_teacher2[i]
                     else:
-                       # print(type(next_tokens[i]), next_tokens[i], next_tokens[i].shape, next_tokens.shape)
+ 
                         probability_tokens = torch.FloatTensor([probs[i, beam_next_tokens[i]], probs_teacher2[i, beam_next_tokens_teacher2[i]], probs_teacher3[i, beam_next_tokens_teacher3[i]]])
-                        #print(probability_tokens)
+                      
                         k = torch.argmax(probability_tokens)
                         if k == 1:
                             new_beam_next_tokens[i] = beam_next_tokens_teacher2[i]
@@ -4846,6 +4905,7 @@ class GenerationMixin:
                         else:
                             new_beam_next_tokens[i] = beam_next_tokens[i]
                 beam_next_tokens = new_beam_next_tokens.detach().clone()
+            
             elif consensus == "random":
                 #create a new tensor by randomly selecting values from the 3 tensors
                 new_beam_next_tokens = torch.zeros_like(beam_next_tokens)
@@ -4877,15 +4937,6 @@ class GenerationMixin:
                     next_tokens = beam_next_tokens_teacher3.detach().clone()
                
 
-
-
-
-
-
-
-
-
-
             ####################################
 
             input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
@@ -4893,8 +4944,21 @@ class GenerationMixin:
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
+            model_kwargs2 = model_teacher2._update_model_kwargs_for_generation(
+                outputs1, model_kwargs2, is_encoder_decoder=self.config.is_encoder_decoder
+            )
+
+            model_kwargs3 = model_teacher3._update_model_kwargs_for_generation(
+                outputs2, model_kwargs3, is_encoder_decoder=self.config.is_encoder_decoder
+            )
             if model_kwargs["past_key_values"] is not None:
                 model_kwargs["past_key_values"] = self._reorder_cache(model_kwargs["past_key_values"], beam_idx)
+
+            if model_kwargs2["past_key_values"] is not None:
+                model_kwargs2["past_key_values"] = model_teacher2._reorder_cache(model_kwargs2["past_key_values"], beam_idx_teacher2)
+            
+            if model_kwargs3["past_key_values"] is not None:
+                model_kwargs3["past_key_values"] = model_teacher3._reorder_cache(model_kwargs3["past_key_values"], beam_idx_teacher3)
 
             if return_dict_in_generate and output_scores:
                 beam_indices = tuple((beam_indices[beam_idx[i]] + (beam_idx[i],) for i in range(len(beam_indices))))
