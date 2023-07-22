@@ -2687,13 +2687,13 @@ class GenerationMixin:
             except:
                 words_len = {}
 
-        # input_ids_t1 = input_ids.clone()
-        # input_ids_t2 = input_ids.clone()
-        # input_ids_t3 = input_ids.clone()
+        input_ids_t1 = input_ids.clone()
+        input_ids_t2 = input_ids.clone()
+        input_ids_t3 = input_ids.clone()
 
-        # probs_t1= input_ids.clone()
-        # probs_t2= input_ids.clone()
-        # probs_t3= input_ids.clone()
+        probs_t1= input_ids.clone()
+        probs_t2= input_ids.clone()
+        probs_t3= input_ids.clone()
 
         sum_log_probs=0
         batch_cur_len = torch.zeros(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
@@ -2728,14 +2728,6 @@ class GenerationMixin:
                 output_attentions=False,#model_teacher2.config.output_attentions,
                 output_hidden_states=False,#model_teacher2.config.output_hidden_states,
             )
-
-            # outputs2 = model_teacher2(
-            #     decoder_input_ids=model_inputs2["decoder_input_ids"],
-            #     encoder_outputs=model_kwargs2["encoder_outputs"],
-            #     return_dict=True,
-            #     output_attentions=False,#model_teacher2.config.output_attentions,
-            #     output_hidden_states=False,#model_teacher2.config.output_hidden_states,
-            # )
 
             #forward pass to get next token for teacher 3
 
@@ -2872,7 +2864,7 @@ class GenerationMixin:
                         new_next_tokens[i] = unique[pos]
                 
                         y = consensus_hits.get(str(cur_len), 0)
-                        hit = 1 if counts[pos].item() == no_of_teacher else 0
+                        hit = 1 if counts[pos].item() >= no_of_teacher - 1 else 0
                         consensus_hits[str(cur_len)] = y + hit
 
                     else:
@@ -2962,6 +2954,9 @@ class GenerationMixin:
 
             # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            input_ids_t1 = torch.cat([input_ids_t1, next_tokens_t1[:, None]], dim=-1)
+            input_ids_t2 = torch.cat([input_ids_t2, next_tokens2[:, None]], dim=-1)
+            input_ids_t3 = torch.cat([input_ids_t3, next_tokens3[:, None]], dim=-1)
 
             #raise Exception("debugging")
             cur_len = cur_len + 1
@@ -3036,7 +3031,7 @@ class GenerationMixin:
                     hidden_states=decoder_hidden_states,
                 )
         else:
-            return input_ids #, input_ids_t1, input_ids_t2, input_ids_t3, probs_t1, probs_t2, probs_t3
+            return input_ids, input_ids_t1, input_ids_t2, input_ids_t3, probs_t1, probs_t2, probs_t3
 
 
     def greedy_search(
@@ -3328,7 +3323,6 @@ class GenerationMixin:
 
 
 
-    #only supports greedy and sampling right now
     #beam search cannot be done with consensus=average or geometric
     def consensus_decider(
         self, 
@@ -3344,6 +3338,7 @@ class GenerationMixin:
         gamma: Optional[float]= 0.5,
         sample: int = 0,
         num_beams: int = 1,
+        batch_size: int = 8,
     ) -> torch.FloatTensor:
         """
             This function is used to decide the consensus of the three teachers
@@ -3461,19 +3456,62 @@ class GenerationMixin:
 
                 next_tokens = new_next_tokens.detach().clone()
             else:
-                #should be beam search now
-                #just to make things easier we do geometric mean on the scores
+                
+                new_beam_idx = torch.zeros_like(beam_indices_all[0])
                 new_beam_next_tokens = torch.zeros_like(beam_next_tokens_all[0])
-                if not torch.equal(beam_next_tokens_all[0], beam_next_tokens_all[1]):
-                    print("beam next tokens not equal")
-                #make sure beam_scores_all is sorted
-                print("beam scores", beam_scores_all[0])
-                print("beam next tokens", beam_next_tokens_all[0])
-               # print("beam scores shape", beam_scores_all[0].shape)
-               # print("beam scores sorted", sorted(beam_scores_all[0], reverse=True))
-              
-                #assert sorted([beam_scores_all[0][i] for i in range(len(beam_scores_all[0]))], reverse=True) == [beam_scores_all[0][i] for i in range(len(beam_scores_all[0]))], "beam scores not sorted"
+                new_beam_scores = torch.zeros_like(beam_scores_all[0]) 
+                #assert(len(beam_scores_all[0]) == batch_size*num_beams)
+                for i in range(batch_size):
+                    for j in range(num_beams):
+                        idx = i*num_beams + j
+                        if idx >= len(beam_scores_all[0]):
+                            break
+                        #Need to make sure if sorting is even needed
+                        #overhead is low so for first version go ahead
+                        # t1_dict = sorted({i: beam_scores_all[0][i].item() for i in range(i*num_beams, i*num_beams+num_beams)}.items(), key=lambda x: x[1], reverse=True)
+                        # t2_dict = sorted({i: beam_scores_all[1][i].item() for i in range(i*num_beams, i*num_beams+num_beams)}.items(), key=lambda x: x[1], reverse=True)
+                        # t3_dict = sorted({i: beam_scores_all[2][i].item() for i in range(i*num_beams, i*num_beams+num_beams)}.items(), key=lambda x: x[1], reverse=True)
+                        #check if t1_dict is sorted
+                       # assert (sorted(t1_dict, key=lambda x: x[0]) == t1_dict)
+                        #print("t1_dict", t1_dict)
+                        #print("beam_indices_all", beam_indices_all)
+                        token_list =[]
+                        #for k in range(num_beams):
+                            #can be done in a better way for general teachers
+                        #beam_index_arr = [t1_dict[k][0], t2_dict[k][0], t3_dict[k][0]]
+                        #assert(beam_index_arr[0] == beam_index_arr[1] == beam_index_arr[2] == )
+                        beam_idx_arr = [beam_indices_all[0][idx], beam_indices_all[1][idx], beam_indices_all[2][idx]]
+                        #beam_scores_arr = [beam_scores_all[0][idx], t2_dict[k][1], t3_dict[k][1]]
+                        
+                        beam_scores_arr = [beam_scores_all[0][idx], beam_scores_all[1][idx], beam_scores_all[2][idx]]
+                        beam_next_tokens_arr = [beam_next_tokens_all[0][idx], beam_next_tokens_all[1][idx], beam_next_tokens_all[2][idx]]
+                        #beam_scores_stacked_k = torch.stack(beam_scores_arr)
+                        beam_next_tokens_stacked_k = torch.stack(beam_next_tokens_arr)
+                        unique, counts = torch.unique(beam_next_tokens_stacked_k, return_counts=True)
+                        print(unique, counts)
 
+                        pos = torch.argmax(counts)
+                        if counts[pos] > beta*no_of_teacher//2:
+                            #if majority agrees, choose that
+                           # print("majority agrees")
+                            new_beam_idx[idx] = beam_idx_arr[pos]
+                            new_beam_next_tokens[idx] = unique[pos]
+                            #can be changed later to include the averaged probabilities of teacher agreeing
+                            new_beam_scores[idx] = beam_scores_arr[pos]
+                        else:
+                            #otherwise choose the one with highest score
+                           # print("majority does not agree")
+                            #import numpy as np
+                            #pos = np.argmax(beam_scores_arr)
+                            beam_scores_stacked_k = torch.stack(beam_scores_arr)    
+                            pos_t = torch.argmax(beam_scores_stacked_k)
+                            #pos_t = torch.tensor(pos, device=beam_scores_arr.device)
+                            new_beam_idx[idx] = beam_idx_arr[pos_t]
+                            new_beam_next_tokens[idx] = beam_next_tokens_arr[pos_t]
+                            new_beam_scores[idx] = beam_scores_arr[pos_t]
+
+
+                 
 
         elif consensus == "random":
             #create a new tensor by randomly selecting values from the 3 tensors
@@ -3530,7 +3568,14 @@ class GenerationMixin:
         else:
             raise ValueError("Invalid consensus method")
 
-        return next_tokens
+        if is_greedy or sample == 1:    
+            return next_tokens
+        else:
+            print(new_beam_idx)
+            print(new_beam_next_tokens)
+            ##print("beam index 0", beam_indices_all[0])
+            #print("beam index 1", beam_indices_all[1], "beam index 2", beam_indices_all[2])
+            return new_beam_idx, new_beam_next_tokens, new_beam_scores
 
   
                
@@ -5111,11 +5156,6 @@ class GenerationMixin:
             # next_token_scores_t3 = next_token_scores_t3_full_vocab.gather(1, next_tokens)
 
 
-            # print("next_tokens_t2", next_tokens_t2[0])
-            # print("next_tokens_t3", next_tokens_t3[0])
-            # print("next_token_scores", next_token_scores[0])
-            # print("next_token_scores_t2", next_token_scores_t2[0])
-            # print("next_token_scores_t3", next_token_scores_t3[0])
 
             next_indices = torch.div(next_tokens, vocab_size, rounding_mode="floor")
             next_tokens = next_tokens % vocab_size
@@ -5127,6 +5167,7 @@ class GenerationMixin:
             next_indices_t3 = torch.div(next_tokens_t3, vocab_size_t3, rounding_mode="floor")
             next_tokens_t3 = next_tokens_t3 % vocab_size_t3
 
+            print(next_tokens, next_indices)
             # stateless
             beam_outputs = beam_scorer.process(
                 input_ids,
@@ -5197,7 +5238,7 @@ class GenerationMixin:
                 new_beam_idx = torch.zeros_like(beam_idx)
                 new_beam_next_tokens = torch.zeros_like(beam_next_tokens)
                 new_beam_scores = torch.zeros_like(beam_scores) 
-                assert(len(beam_scores_t2) == batch_size*num_beams)
+                #assert(len(beam_scores_t2) == batch_size*num_beams)
                 for i in range(batch_size):
                     for j in range(num_beams):
                         idx = i*num_beams + j
@@ -5232,8 +5273,7 @@ class GenerationMixin:
                 beam_scores_all = [beam_scores, beam_scores_t2, beam_scores_t3]
                 beam_next_tokens_all = [beam_next_tokens, beam_next_tokens_t2, beam_next_tokens_t3]
                 beam_idx_all = [beam_idx, beam_idx_t2, beam_idx_t3]    
-                temp_next_tokens = self.consensus_decider(beam_scores_all = beam_scores_all, beam_next_tokens_all= beam_next_tokens_all, beam_indices_all=beam_idx_all, beta=1, no_of_teacher=3, consensus=consensus, gamma=0, sample=0, num_beams=num_beams)
-
+                beam_idx, beam_next_tokens,beam_scores = self.consensus_decider(beam_scores_all = beam_scores_all, beam_next_tokens_all= beam_next_tokens_all, beam_indices_all=beam_idx_all, beta=1, no_of_teacher=3, consensus=consensus, gamma=0, sample=0, num_beams=num_beams)
 
             ####################################
             #To decide best beam search output among teacher1, teacher2, teacher3
